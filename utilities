@@ -1,0 +1,232 @@
+import torch
+from torch import nn, optim
+from torchvision import transforms, datasets, models
+from workspace_utils import keep_awake, active_session
+from PIL import Image
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+def load_data(data_dir):
+    train_dir = data_dir + '/train'
+    valid_dir = data_dir + '/valid'
+    test_dir = data_dir + '/test' 
+    traindata_transforms = transforms.Compose([
+                transforms.RandomRotation(40),  # copy12: change 10 to 40
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                                    mean=[0.485, 0.456, 0.406],
+                                    std=[0.229, 0.224, 0.225])
+    ])
+    testdata_transforms = transforms.Compose([
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                                    mean=[0.485, 0.456, 0.406],
+                                    std=[0.229, 0.224, 0.225])
+    ])
+    train = datasets.ImageFolder(train_dir, transform=train_data_transforms)
+    val   = datasets.ImageFolder(valid_dir, transform=val_data_transforms)
+    test  = datasets.ImageFolder(test_dir, transform=val_data_transforms)
+    trainloader = torch.utils.data.DataLoader(train, 64, True)
+    valloader   = torch.utils.data.DataLoader(val,   32, True)
+    testloader  = torch.utils.data.DataLoader(test, 32, True)
+    folders = {'train':train,
+               'test':val,
+               'test':test}
+    loaders = {'trainloader':trainloader,
+               'valloader':valloader,
+               'testloader':testloader}
+    
+    return folders, loaders
+
+def model(model='vgg16', hidden_units=512):
+    
+    for param in model.parameters():
+        param.requires_grad=False
+        
+    if model == 'vgg16':
+       model = models.vgg16(pretrained=True)
+       
+    elif model == 'vgg19':
+       model = models.vgg19(pretrained=True)
+    
+    clf = nn.Sequential(
+            nn.Linear(25088, hidden_units),
+            nn.ReLU(),
+            nn.Dropout(.5),
+            nn.Linear(hidden_units, 102),
+            nn.LogSoftmax(dim=1)
+         )
+    model.classifier = clf
+    return model
+def compilation(model, lr=0.001):
+    criterion = nn.NLLLoss()
+    optimizer = optim.Adam(model.classifier.parameters(), lr=lr)
+    return criterion, optimizer
+
+def fit(model, trainloader, epochs=4, check_every=1, gpu_or_cpu='cpu'):
+    
+    criterion, optimizer = compilation(model)
+    
+    device = torch.device('cuda' if gpu_or_cpu=='gpu' else 'cpu')
+    
+    iters = 0
+    train_loss=0
+    model.to(device)
+    
+    with active_session():
+        for e in range(epochs):
+            for inputs, labels in trainloader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                iters += 0
+                optimizer.zero_grad()
+                out = model.forward(inputs)
+                loss = criterion(out, labels)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item()
+                if iters%check_every == 0:
+                    model.eval()
+                    with torch.no_grad():
+                        accuracy, loss_val = 0, 0
+                        for imgs, classes in valloader:
+                            imgs, classes = imgs.to(device), classes.to(device)
+
+                            # loss
+                            pred = model.forward(imgs)
+                            pred_loss = criterion(pred, classes)
+                            loss_val += pred_loss.item()
+
+                            # accuracy
+                            topv, topc = pred.topk(1, dim=1)
+                            eq = topc == classes.view(*topc.shape)
+                            accuracy += torch.mean(eq.type(torch.FloatTensor)).item()
+
+                    print(f"Epoch {e+1}/{epochs}.. "
+                          f"Train loss: {train_loss/check_every:.3f}.. "
+                          f"Test loss: {loss_val/len(valloader):.3f}.. "
+                          f"Test accuracy: {(accuracy/len(valloader))*100:.2f}%")
+                    train_loss = 0
+                    model.train()
+                    
+                    
+                    
+                    
+                    
+                    
+def evaluate(model, testloader):
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    criterion, _ = compilation(model)
+    
+    test_loss = 0
+    acc = 0
+
+    for imgs, labels in testloader:
+        model.eval()
+        imgs, labels = imgs.to(device), labels.to(device)
+        with torch.no_grad():
+
+            out = model.forward(imgs)
+            loss = criterion(out, labels)
+            test_loss += loss.item()
+
+            pred = torch.exp(out)
+            max_v, max_k = pred.topk(1, dim=1)
+            eq = max_k == labels.view(*max_k.shape)
+
+            acc += torch.mean(eq.type(torch.FloatTensor)).item()
+
+    print(f'Test Loss: {test_loss/len(testloader):.4f}\nTest Accuracy: {(acc/len(testloader))*100:.2f}%')
+
+def save(file_name, traindata_folder, arch_name, input_size, output_size, batch_size, epochs, optimizer):
+    
+    model.class2idx = traindata_folder.class_to_idx
+    
+    checkpoint = {
+          'model':arch_name,
+          'input_size': input_size,
+          'output_size': output_size,
+          'batch_size': batch_size,
+          'epochs' : epochs,
+          'optimizer': optimizer.state_dict(),
+          'classifier': model.classifier,
+          'class2idx': model.class2idx,
+          'state_dict': model.state_dict()
+    }
+
+    torch.save(checkpoint, file_name)
+
+    
+def load(path):
+    checkpoint = torch.load(path, map_location='cpu')
+    model_name = checkpoint['model']
+    model = getattr(models, checkpoint['model'])(pretrained=True)
+    model.state_dict = model.state_dict()
+    model.classifier = checkpoint['classifier']
+    model.class2idx = checkpoint['class2idx']
+    model.epochs = checkpoint['epochs']
+    optimizer = optim.Adam(model.classifier.parameters())
+    optimizer.load_state_dict(checkpoint['optimizer'])
+    
+    return model, optimizer
+
+
+def process_image(image):
+ 
+    img = Image.open(image)
+    img = img.resize((256, 256))
+    v = 0.5*(256-224)
+    img = img.crop((v, v, 256-v, 256-v))
+    
+    img = np.array(img)/255
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
+    img = (img - mean) / std
+
+    return img.transpose(2,0,1)
+
+
+def imshow(image, ax=None, title=None):
+    """Imshow for Tensor."""
+    if ax is None:
+        fig, ax = plt.subplots()
+    
+    # PyTorch tensors assume the color channel is the first dimension
+    # but matplotlib assumes is the third dimension
+    image = image.transpose((1, 2, 0))
+    
+    # Undo preprocessing
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
+    image = std * image + mean
+    
+    # Image needs to be clipped between 0 and 1 or it looks like noise when displayed
+    image = np.clip(image, 0, 1)
+    ax.imshow(image)
+    
+    return ax
+
+
+def predict(image_path, model, topk=5, gpu_or_cpu='cpu'):
+    
+    device = torch.device('cuda' if gpu_or_cpu=='gpu' else 'cpu')
+    
+    img = process_image(image_path)
+    img = torch.from_numpy(np.array([img])).float()
+    
+    img = img.to(device)
+    model = model.to(device)
+
+    model.eval()
+    out = model.forward(img)
+    out = torch.exp(out)
+    top_v, top_k = out.topk(topk, dim=1)
+    props = top_v
+    classes = [model.class2idx[str(k)] for k in top_k[0].numpy()]
+    return props, classess
